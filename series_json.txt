@@ -1,0 +1,5 @@
+[Run 1 | 2026-07-31 18:43 UTC] serial_no range: 21–30
+  Picked serial_nos : 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
+  Items in batch    : 10
+  Total remaining   : 4980
+
