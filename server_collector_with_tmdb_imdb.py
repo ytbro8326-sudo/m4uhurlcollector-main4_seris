@@ -4,23 +4,26 @@ import json
 import os
 import time
 import random
+import threading
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
-from itertools import cycle
+from collections import deque
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── API Configurations ───────────────────────────────────────────
 TMDB_API_KEY = "6fad3f86b8452ee232deb7977d7dcf58"
 
-# File paths
-TARGET_JSON = os.getenv("TARGET_JSON", "movies.json")
+TARGET_JSON    = os.getenv("TARGET_JSON", "movies.json")
 PROCESSED_FILE = "list_of_already_processed_urls.txt"
-ERROR_FILE = "list_of_facing_error.txt"
+ERROR_FILE     = "list_of_facing_error.txt"
 
-# Detect if we are processing a series file
 IS_SERIES = "series" in TARGET_JSON.lower()
 
-# ── URL Limit ────────────────────────────────────────────────────
+HTTPS_TEST_URL = "https://ww1.m4uhd.page/"
+
 def parse_url_limit():
     raw = os.getenv("URL_LIMIT", "100").strip().lower()
     if raw == "full":
@@ -34,44 +37,232 @@ def parse_url_limit():
 
 URL_LIMIT = parse_url_limit()
 
-# ── Proxies ──────────────────────────────────────────────────────
-PROXY_USER = "dxicdysy"
-PROXY_PASS = "yndikr9coeto"
 
-PROXY_LIST_RAW = [
-    ("31.59.20.176",    6754),
-    ("31.56.127.193",   7684),
-    ("45.38.107.97",    6014),
-    ("198.105.121.200", 6462),
-    ("64.137.96.74",    6641),
-    ("198.23.243.226",  6361),
-    ("38.154.185.97",   6370),
-    ("84.247.60.125",   6095),
-    ("142.111.67.146",  5611),
-    ("191.96.254.138",  6185),
-]
+# ══════════════════════════════════════════════════════════════════
+#  FREE PROXY SCRAPER
+# ══════════════════════════════════════════════════════════════════
 
-formatted_proxies = [
-    f"http://{PROXY_USER}:{PROXY_PASS}@{ip}:{port}" for ip, port in PROXY_LIST_RAW
-]
-proxy_pool = cycle(formatted_proxies)
+def scrape_free_proxies():
+    proxies = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-# ── Single Session ───────────────────────────────────────────────
+    try:
+        r = requests.get("https://free-proxy-list.net/", headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table")
+        if table:
+            for row in table.find_all("tr")[1:]:
+                cols = row.find_all("td")
+                if len(cols) >= 7:
+                    ip     = cols[0].text.strip()
+                    port   = cols[1].text.strip()
+                    https  = cols[6].text.strip().lower()
+                    scheme = "https" if https == "yes" else "http"
+                    proxies.append(f"{scheme}://{ip}:{port}")
+        print(f"  [+] free-proxy-list.net  : {len(proxies)} proxies")
+    except Exception as e:
+        print(f"  [-] free-proxy-list.net failed : {e}")
+
+    count_before = len(proxies)
+    try:
+        r = requests.get("https://www.sslproxies.org/", headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table")
+        if table:
+            for row in table.find_all("tr")[1:]:
+                cols = row.find_all("td")
+                if len(cols) >= 2:
+                    ip   = cols[0].text.strip()
+                    port = cols[1].text.strip()
+                    proxies.append(f"https://{ip}:{port}")
+        print(f"  [+] sslproxies.org       : {len(proxies) - count_before} proxies")
+    except Exception as e:
+        print(f"  [-] sslproxies.org failed : {e}")
+
+    count_before = len(proxies)
+    try:
+        url = (
+            "https://api.proxyscrape.com/v2/?request=displayproxies"
+            "&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all"
+        )
+        r = requests.get(url, headers=headers, timeout=10)
+        for line in r.text.strip().splitlines():
+            line = line.strip()
+            if ":" in line:
+                proxies.append(f"http://{line}")
+        print(f"  [+] proxyscrape API      : {len(proxies) - count_before} proxies")
+    except Exception as e:
+        print(f"  [-] proxyscrape API failed : {e}")
+
+    count_before = len(proxies)
+    try:
+        url = (
+            "https://proxylist.geonode.com/api/proxy-list"
+            "?limit=100&page=1&sort_by=lastChecked&sort_type=desc&protocols=http,https"
+        )
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        for entry in data.get("data", []):
+            ip       = entry.get("ip", "")
+            port     = entry.get("port", "")
+            protocol = entry.get("protocols", ["http"])[0]
+            if ip and port:
+                proxies.append(f"{protocol}://{ip}:{port}")
+        print(f"  [+] geonode API          : {len(proxies) - count_before} proxies")
+    except Exception as e:
+        print(f"  [-] geonode API failed : {e}")
+
+    proxies = list(dict.fromkeys(proxies))
+    print(f"\n  [*] Total unique proxies scraped: {len(proxies)}")
+    return proxies
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PROXY POOL
+# ══════════════════════════════════════════════════════════════════
+
+class ProxyPool:
+    def __init__(self, proxies, test_url=HTTPS_TEST_URL, timeout=10):
+        self._all      = proxies
+        self._live     = deque()
+        self._lock     = threading.Lock()
+        self._test_url = test_url
+        self._timeout  = timeout
+        self._validate_all()
+
+    def _validate_all(self):
+        print(f"\n[*] Validating {len(self._all)} proxies against {self._test_url} ...")
+        threads = []
+        for p in self._all:
+            t = threading.Thread(target=self._check, args=(p,))
+            t.daemon = True
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=self._timeout + 3)
+        print(f"[*] {len(self._live)} / {len(self._all)} proxies can tunnel HTTPS to target.")
+        if not self._live:
+            raise RuntimeError("[!] No live proxies found that support HTTPS tunneling to the target.")
+
+    def _check(self, proxy_url):
+        try:
+            r = requests.get(
+                self._test_url,
+                proxies={"http": proxy_url, "https": proxy_url},
+                timeout=self._timeout,
+                verify=False,
+                allow_redirects=True,
+            )
+            # Only accept proxies where the site returns 200
+            # 403 means site blocked the proxy IP — useless for scraping
+            if r.status_code == 200:
+                with self._lock:
+                    self._live.append(proxy_url)
+                print(f"  [+] Live [200] : {proxy_url}")
+        except Exception:
+            pass
+
+    def next(self):
+        with self._lock:
+            if not self._live:
+                raise RuntimeError("[!] Proxy pool is empty.")
+            proxy = self._live.popleft()
+            self._live.append(proxy)
+            return proxy
+
+    def remove(self, proxy_url):
+        with self._lock:
+            try:
+                self._live.remove(proxy_url)
+                print(f"  [x] Removed dead proxy: {proxy_url} | Remaining: {len(self._live)}")
+            except ValueError:
+                pass
+
+    def size(self):
+        with self._lock:
+            return len(self._live)
+
+    def is_empty(self):
+        with self._lock:
+            return len(self._live) == 0
+
+    def refill(self):
+        print("\n[!] Pool running low — re-scraping fresh proxies...")
+        new_proxies = scrape_free_proxies()
+        print(f"[*] Validating {len(new_proxies)} candidates against {self._test_url} ...")
+        found = []
+        lock  = threading.Lock()
+
+        def _check_new(proxy_url):
+            try:
+                r = requests.get(
+                    self._test_url,
+                    proxies={"http": proxy_url, "https": proxy_url},
+                    timeout=self._timeout,
+                    verify=False,
+                    allow_redirects=True,
+                )
+                if r.status_code == 200:
+                    with lock:
+                        found.append(proxy_url)
+            except Exception:
+                pass
+
+        threads = [threading.Thread(target=_check_new, args=(p,)) for p in new_proxies]
+        for t in threads:
+            t.daemon = True
+            t.start()
+        for t in threads:
+            t.join(timeout=self._timeout + 3)
+
+        added = 0
+        with self._lock:
+            existing = set(self._live)
+            for p in found:
+                if p not in existing:
+                    self._live.append(p)
+                    added += 1
+
+        print(f"[*] Refill complete. Added {added} new proxies. Pool size: {self.size()}")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SESSION + PROXY HELPERS
+# ══════════════════════════════════════════════════════════════════
+
 S = requests.Session()
 S.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "X-Requested-With": "XMLHttpRequest"
 })
 
+_current_proxy = {"url": None}
+pool = None
+
+
 def set_new_proxy():
-    new_proxy = next(proxy_pool)
-    S.proxies.update({"http": new_proxy, "https": new_proxy})
-    safe_display = new_proxy.split('@')[-1]
-    print(f"  [*] Rotating IP... Now using proxy: {safe_display}")
+    if pool.size() < 5:
+        pool.refill()
+    _current_proxy["url"] = pool.next()
+    S.proxies.update({
+        "http":  _current_proxy["url"],
+        "https": _current_proxy["url"]
+    })
+    print(f"  [*] Rotating IP... Now using proxy: {_current_proxy['url']}")
 
-set_new_proxy()
 
-# ── File I/O Helpers ─────────────────────────────────────────────
+def report_bad_proxy():
+    if _current_proxy["url"]:
+        pool.remove(_current_proxy["url"])
+    if pool.is_empty():
+        pool.refill()
+    set_new_proxy()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FILE I/O HELPERS
+# ══════════════════════════════════════════════════════════════════
+
 def init_files():
     if not os.path.exists(PROCESSED_FILE):
         open(PROCESSED_FILE, "w", encoding="utf-8").close()
@@ -88,7 +279,11 @@ def log_error(url, error_msg):
     with open(ERROR_FILE, "a", encoding="utf-8") as f:
         f.write(f"{url} | ERROR: {error_msg}\n")
 
-# ── TMDB Lookup ──────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+#  TMDB LOOKUP
+# ══════════════════════════════════════════════════════════════════
+
 def get_tmdb_id_from_imdb(imdb_id):
     if not TMDB_API_KEY:
         return ""
@@ -105,42 +300,64 @@ def get_tmdb_id_from_imdb(imdb_id):
         print(f"  [!] Failed to fetch TMDb ID for {imdb_id}: {e}")
     return ""
 
-# ── HTML Helpers ─────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+#  HTML HELPERS — with debug prints to expose silent failures
+# ══════════════════════════════════════════════════════════════════
+
 def base(url):
     p = urlparse(url)
     return f"{p.scheme}://{p.netloc}"
 
 def csrf(html):
     m = re.search(r'<meta name="csrf-token" content="([^"]+)"', html)
-    return m.group(1) if m else ""
+    token = m.group(1) if m else ""
+    if not token:
+        print("  [DEBUG] WARNING: csrf-token NOT found in page HTML")
+    else:
+        print(f"  [DEBUG] csrf-token found: {token[:20]}...")
+    return token
 
 def spans(html):
     soup = BeautifulSoup(html, "html.parser")
-    return [
+    all_spans_with_data = soup.find_all("span", attrs={"data": True})
+    valid = [
         (s.get_text(strip=True), s["data"])
-        for s in soup.find_all("span", attrs={"data": True})
+        for s in all_spans_with_data
         if len(s.get("data", "")) > 10
     ]
+    print(f"  [DEBUG] spans() — total <span data=...> found: {len(all_spans_with_data)}, valid (len>10): {len(valid)}")
+    if not valid:
+        # Show a snippet of the raw HTML to see what the page actually looks like
+        snippet = html[:2000].replace("\n", " ")
+        print(f"  [DEBUG] Page HTML snippet (first 2000 chars):\n{snippet}\n")
+    return valid
 
 def iframe(html):
     m = re.search(r'<iframe[^>]+src="([^"]+)"', html)
-    return m.group(1) if m else ""
+    url = m.group(1) if m else ""
+    if not url:
+        print(f"  [DEBUG] iframe() — no <iframe src=...> found. Response snippet: {html[:500]}")
+    else:
+        print(f"  [DEBUG] iframe() — found embed URL: {url[:80]}")
+    return url
 
 def post(url, data, ref):
     r = S.post(
         url, data=data,
         headers={"Referer": ref, "Content-Type": "application/x-www-form-urlencoded"},
-        timeout=15
+        timeout=15,
+        verify=False
     )
     r.raise_for_status()
     return r.text
 
-# ── Fetch servers for a single episode ID ────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+#  EPISODE HELPERS
+# ══════════════════════════════════════════════════════════════════
+
 def fetch_servers_for_episode(root, token, ep_id, target_url, max_retries=3):
-    """
-    POSTs to /ajaxtv with the given ep_id and resolves all embed iframes.
-    Returns a list of embed URLs (could be empty on failure).
-    """
     for attempt in range(max_retries):
         try:
             time.sleep(random.uniform(1.5, 3.0))
@@ -150,7 +367,7 @@ def fetch_servers_for_episode(root, token, ep_id, target_url, max_retries=3):
                 target_url
             )
             servers = spans(server_html)
-            embeds = []
+            embeds  = []
             for label, data in servers:
                 embed_html = post(
                     f"{root}/ajax",
@@ -165,7 +382,7 @@ def fetch_servers_for_episode(root, token, ep_id, target_url, max_retries=3):
         except requests.exceptions.RequestException as e:
             print(f"    [!] Episode {ep_id} attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                set_new_proxy()
+                report_bad_proxy()
             else:
                 print(f"    [!] Giving up on episode {ep_id}.")
                 return []
@@ -173,15 +390,9 @@ def fetch_servers_for_episode(root, token, ep_id, target_url, max_retries=3):
             print(f"    [!] Unexpected error on episode {ep_id}: {e}")
             return []
 
-# ── Extract all episode IDs from series page ─────────────────────
+
 def get_all_episode_ids(html):
-    """
-    Scrapes all episode IDs from the series page HTML.
-    The site renders them as idepisode="XXXXX" attributes.
-    Returns an ordered list of unique episode IDs.
-    """
-    # Collect all matches preserving order, deduplicate keeping first occurrence
-    seen = set()
+    seen    = set()
     ordered = []
     for ep_id in re.findall(r'idepisode=["\'](\w+)["\']', html):
         if ep_id not in seen:
@@ -189,63 +400,74 @@ def get_all_episode_ids(html):
             ordered.append(ep_id)
     return ordered
 
-# ── Main extraction: movies ───────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN EXTRACTION: MOVIES
+# ══════════════════════════════════════════════════════════════════
+
 def extract_movie_servers(target_url, max_retries=3):
     for attempt in range(max_retries):
         try:
             time.sleep(random.uniform(2.5, 5.0))
-            html = S.get(target_url, timeout=15).text
-            token = csrf(html)
-            root = base(target_url)
+            print(f"  [DEBUG] Fetching page: {target_url}")
+            r = S.get(target_url, timeout=15, verify=False)
+            print(f"  [DEBUG] Page status code: {r.status_code}")
+            html    = r.text
+            token   = csrf(html)
+            root    = base(target_url)
             servers = spans(html)
+
+            if not servers:
+                print(f"  [DEBUG] No servers found in page — skipping AJAX calls")
+                log_error(target_url, "spans() returned empty — page structure may have changed")
+                return []
+
             embeds = []
             for label, data in servers:
-                embed_html = post(f"{root}/ajax", {"m4u": data, "_token": token}, target_url)
-                url = iframe(embed_html)
-                if url:
-                    embeds.append(url)
+                print(f"  [DEBUG] POSTing to /ajax for server label='{label}' data='{data[:30]}...'")
+                try:
+                    embed_html = post(f"{root}/ajax", {"m4u": data, "_token": token}, target_url)
+                    url = iframe(embed_html)
+                    if url:
+                        embeds.append(url)
+                except Exception as e:
+                    print(f"  [DEBUG] /ajax POST failed for label='{label}': {e}")
+
             return embeds
 
         except requests.exceptions.RequestException as e:
             print(f"  [!] Attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                set_new_proxy()
+                report_bad_proxy()
             else:
                 log_error(target_url, f"Failed after {max_retries} retries: {str(e)}")
                 return []
         except Exception as e:
+            print(f"  [!] Unexpected error: {e}")
             log_error(target_url, f"Unexpected error: {str(e)}")
             return []
 
-# ── Main extraction: series (all episodes) ───────────────────────
-def extract_series_all_episodes(target_url, max_retries=3):
-    """
-    Fetches the series page, collects ALL episode IDs, then loops through
-    every episode fetching its servers.
 
-    Returns a dict:
-    {
-        "total_episodes": 12,
-        "episodes": {
-            "1": ["url1", "url2", ...],
-            "2": ["url1"],
-            ...
-        },
-        "imdb_id": "tt1234567"   # first one found across all embeds
-    }
-    """
+# ══════════════════════════════════════════════════════════════════
+#  MAIN EXTRACTION: SERIES
+# ══════════════════════════════════════════════════════════════════
+
+def extract_series_all_episodes(target_url, max_retries=3):
     for attempt in range(max_retries):
         try:
             time.sleep(random.uniform(2.5, 5.0))
-            html = S.get(target_url, timeout=15).text
+            print(f"  [DEBUG] Fetching series page: {target_url}")
+            r = S.get(target_url, timeout=15, verify=False)
+            print(f"  [DEBUG] Page status code: {r.status_code}")
+            html  = r.text
             token = csrf(html)
-            root = base(target_url)
-            break  # page loaded fine
+            root  = base(target_url)
+            break
 
         except requests.exceptions.RequestException as e:
             print(f"  [!] Page load attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                set_new_proxy()
+                report_bad_proxy()
             else:
                 log_error(target_url, f"Series page load failed after {max_retries} retries: {str(e)}")
                 return None
@@ -254,6 +476,7 @@ def extract_series_all_episodes(target_url, max_retries=3):
             return None
 
     ep_ids = get_all_episode_ids(html)
+    print(f"  [DEBUG] Episode IDs found: {ep_ids[:5]}{'...' if len(ep_ids) > 5 else ''}")
     if not ep_ids:
         log_error(target_url, "No episode IDs found on series page.")
         return None
@@ -272,7 +495,6 @@ def extract_series_all_episodes(target_url, max_retries=3):
 
         if embeds:
             result["episodes"][str(ep_num)] = embeds
-            # Grab first IMDb ID found across any embed URL
             if not result["imdb_id"]:
                 for embed_url in embeds:
                     match = re.search(r'(tt\d{7,10})', embed_url)
@@ -284,36 +506,53 @@ def extract_series_all_episodes(target_url, max_retries=3):
             result["episodes"][str(ep_num)] = []
             print(f"       No servers found for episode {ep_num}.")
 
-        # Small pause between episodes to be polite to the server
         time.sleep(random.uniform(1.0, 2.0))
 
     return result
 
-# ── Apply series result to JSON item ─────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+#  APPLY SERIES RESULT
+# ══════════════════════════════════════════════════════════════════
+
 def apply_series_result(item, series_data):
-    """
-    Writes the flat key structure onto the item dict:
-      total_episodes, episode-1-server1, episode-1-server2, ...
-    Cleans up old movie-style server keys if present.
-    """
-    # Remove old movie-style keys if they exist
     for k in ["server1", "server2", "server3", "server4"]:
         item.pop(k, None)
-
     item["total_episodes"] = series_data["total_episodes"]
-
     for ep_num_str, embeds in series_data["episodes"].items():
         for server_idx, embed_url in enumerate(embeds, start=1):
             key = f"episode-{ep_num_str}-server{server_idx}"
             item[key] = embed_url
 
-# ── Is series item already processed? ────────────────────────────
 def series_already_done(item):
-    """Returns True if the item already has at least episode-1-server1 filled."""
     return bool(item.get("episode-1-server1", ""))
 
-# ── Main ─────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+#  DETECT TARGET HOST FROM JSON
+# ══════════════════════════════════════════════════════════════════
+
+def detect_target_host(json_path):
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for item in data:
+            url = item.get("url", "")
+            if url.startswith("https://"):
+                p = urlparse(url)
+                return f"{p.scheme}://{p.netloc}/"
+    except Exception:
+        pass
+    return HTTPS_TEST_URL
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════
+
 def main():
+    global pool
+
     limit_label = "full (no limit)" if URL_LIMIT is None else str(URL_LIMIT)
     print(f"[*] Starting job for file : {TARGET_JSON}")
     print(f"[*] Mode                  : {'SERIES' if IS_SERIES else 'MOVIES'}")
@@ -323,14 +562,21 @@ def main():
         print(f"[!] Error: {TARGET_JSON} not found in repository.")
         sys.exit(1)
 
+    test_url = detect_target_host(TARGET_JSON)
+    print(f"[*] Proxy test URL        : {test_url}")
+
+    print("\n[*] Scraping free proxies...")
+    raw_proxies = scrape_free_proxies()
+    pool = ProxyPool(raw_proxies, test_url=test_url)
+    set_new_proxy()
+
     processed_urls = init_files()
 
     with open(TARGET_JSON, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    print(f"[*] Total records in {TARGET_JSON}: {len(data)}")
+    print(f"\n[*] Total records in {TARGET_JSON}: {len(data)}")
 
-    # ── Build queue ───────────────────────────────────────────────
     if IS_SERIES:
         queue = [
             item for item in data
@@ -353,12 +599,14 @@ def main():
 
     try:
         for item in queue:
+            if pool.size() < 5:
+                pool.refill()
+
             target_url = item["url"]
             print(f"\n-> Processing: {item.get('title', 'Unknown Title')}")
             print(f"   URL: {target_url}")
 
             try:
-                # ── SERIES PATH ───────────────────────────────────
                 if IS_SERIES:
                     series_data = extract_series_all_episodes(target_url)
 
@@ -368,7 +616,6 @@ def main():
 
                     apply_series_result(item, series_data)
 
-                    # IMDb / TMDb
                     found_imdb_id = series_data.get("imdb_id", "")
                     if found_imdb_id:
                         item["imdb_id"] = found_imdb_id
@@ -380,7 +627,6 @@ def main():
 
                     print(f"   Done — {series_data['total_episodes']} episodes written.")
 
-                # ── MOVIES PATH ───────────────────────────────────
                 else:
                     embeds = extract_movie_servers(target_url)
 
@@ -408,7 +654,6 @@ def main():
 
                     print(f"   Processed and mapped {len(embeds)} servers.")
 
-                # Mark done
                 processed_urls.add(target_url)
                 log_processed(target_url)
 
@@ -422,6 +667,7 @@ def main():
         with open(TARGET_JSON, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
         print(f"\n[*] Saved updates to {TARGET_JSON}.")
+
 
 if __name__ == "__main__":
     main()
