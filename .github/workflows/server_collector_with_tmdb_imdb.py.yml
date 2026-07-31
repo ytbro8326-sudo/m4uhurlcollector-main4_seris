@@ -1,0 +1,91 @@
+name: server URL collector and tmdb id extract with help with imdb id
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Runs every 6 hours (defaults to movies.json, 100 URLs)
+  workflow_dispatch:
+    inputs:
+      target_json:
+        description: 'Select the JSON file to process'
+        required: true
+        default: 'movies.json'
+        type: choice
+        options:
+          - movies.json
+          - movies2.json
+          - movies3.json
+          - movies4.json
+          - movies5.json
+          - movies6.json
+          - movies7.json
+          - movies8.json
+          - movies9.json
+          - movies10.json
+          - movies11.json
+          - movies12.json
+          - movies13.json
+          - movies14.json
+          - movies15.json
+          - movies16.json
+          - movies17.json
+          - movies18.json
+          - series.json
+          - series2.json
+
+      url_limit:
+        description: 'How many URLs to process (default: 100)'
+        required: false
+        default: '100'
+        type: choice
+        options:
+          - '10'
+          - '50'
+          - '100'
+          - '250'
+          - '500'
+          - '1000'
+          - '2500'
+          - 'full'
+
+# Grant the action permission to push code back to your repo
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests curl-cffi beautifulsoup4
+
+      - name: Run Scraper
+        env:
+          # Passes the chosen dropdown option (or default) to Python
+          TARGET_JSON: ${{ github.event.inputs.target_json || 'movies.json' }}
+          URL_LIMIT: ${{ github.event.inputs.url_limit || '100' }}
+        run: python server_collector_with_tmdb_imdb.py
+
+      - name: Commit and Push Changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Stage all changed or newly created files (.json and .txt)
+          git add .
+          
+          # Commit only if there are changes
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update $TARGET_JSON (limit: $URL_LIMIT URLs)"
+          
+          # Push to the main branch
+          git push
