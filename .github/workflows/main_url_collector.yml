@@ -1,0 +1,82 @@
+name: Main Url Collector
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ── Movie page range ────────────────────────────────────────────────────
+      start_page:
+        description: "Movies: start page (leave blank to skip movies)"
+        required: false
+        default: ""
+      end_page:
+        description: "Movies: end page (leave blank to skip movies)"
+        required: false
+        default: ""
+      # ── Series page range ───────────────────────────────────────────────────
+      series_start_page:
+        description: "Series: start page (leave blank to skip series)"
+        required: false
+        default: ""
+      series_end_page:
+        description: "Series: end page (leave blank to skip series, max 177)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build run command and execute
+        run: |
+          CMD="python main_url_collector.py"
+
+          # Append movie range only if both values are provided
+          if [ -n "${{ github.event.inputs.start_page }}" ] && [ -n "${{ github.event.inputs.end_page }}" ]; then
+            CMD="$CMD ${{ github.event.inputs.start_page }} ${{ github.event.inputs.end_page }}"
+          fi
+
+          # Append series range only if both values are provided
+          if [ -n "${{ github.event.inputs.series_start_page }}" ] && [ -n "${{ github.event.inputs.series_end_page }}" ]; then
+            CMD="$CMD --series ${{ github.event.inputs.series_start_page }} ${{ github.event.inputs.series_end_page }}"
+          fi
+
+          echo "Running: $CMD"
+          eval "$CMD"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collected-json-${{ github.run_number }}
+          path: |
+            *.json
+            page_already_processed.txt
+            series_page_already_processed.txt
+          retention-days: 30
+
+      - name: Commit and push JSON and tracker files
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add *.json page_already_processed.txt series_page_already_processed.txt
+
+          git diff --cached --quiet && echo "No changes to commit" || \
+          git commit -m "chore: update collected json and tracking files [movies=${{ github.event.inputs.start_page }}-${{ github.event.inputs.end_page }}] [series=${{ github.event.inputs.series_start_page }}-${{ github.event.inputs.series_end_page }}] [skip ci]"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
