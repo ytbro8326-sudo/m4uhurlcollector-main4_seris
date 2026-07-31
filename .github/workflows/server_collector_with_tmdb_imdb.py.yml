@@ -1,66 +1,60 @@
-name: server URL collector and tmdb id extract with help with imdb id
+name: Series Collector — Auto-Paginate (10 items / run)
 
 on:
- # schedule:
-    #- cron: '0 */6 * * *' # Runs every 6 hours (defaults to movies.json, 100 URLs)
+  # ── Manual kick-off (first time) ──────────────────────────────────
   workflow_dispatch:
     inputs:
-      target_json:
-        description: 'Select the JSON file to process'
-        required: true
-        default: 'movies.json'
-        type: choice
-        options:
-          - movies.json
-          - movies2.json
-          - movies3.json
-          - movies4.json
-          - movies5.json
-          - movies6.json
-          - movies7.json
-          - movies8.json
-          - movies9.json
-          - movies10.json
-          - movies11.json
-          - movies12.json
-          - movies13.json
-          - movies14.json
-          - movies15.json
-          - movies16.json
-          - movies17.json
-          - movies18.json
-          - series.json
-          - series2.json
-
-      url_limit:
-        description: 'How many URLs to process (default: 100)'
+      force_restart:
+        description: 'Clear processed-URL log and restart from the beginning?'
         required: false
-        default: '100'
+        default: 'false'
         type: choice
         options:
-          - '10'
-          - '50'
-          - '100'
-          - '250'
-          - '500'
-          - '1000'
-          - '2500'
-          - 'full'
+          - 'false'
+          - 'true'
 
-# Grant the action permission to push code back to your repo
+  # ── Self-triggered re-runs arrive here via repository_dispatch ────
+  repository_dispatch:
+    types: [series_auto_continue]
+
+# Allow the bot to push JSON changes AND trigger new workflow runs
 permissions:
   contents: write
+  actions: write          # needed to call the Actions API for re-dispatch
+
+env:
+  TARGET_JSON:   "series.json"
+  URL_LIMIT:     "10"
+  RANGE_FILE:    "series_json.txt"   # serial_no range tracker
 
 jobs:
-  scrape-and-update:
+  scrape-and-continue:
     runs-on: ubuntu-latest
 
     steps:
+      # ── 1. Checkout ────────────────────────────────────────────────
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
+      # ── 2. Optional hard-reset (only when manually requested) ──────
+      - name: Clear all tracking logs (force_restart only)
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.force_restart == 'true'
+        run: |
+          echo "[reset] Clearing processed-URL log and range-tracker..."
+          > list_of_already_processed_urls.txt
+          > series_json.txt
+
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+          git add list_of_already_processed_urls.txt series_json.txt
+          git diff --staged --quiet || git commit -m "Reset: cleared all tracking files for series.json"
+          git push
+
+      # ── 3. Python setup ────────────────────────────────────────────
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -69,23 +63,216 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests curl-cffi beautifulsoup4
 
+      # ── 4. Check remaining + write range tracker for this batch ───
+      #
+      #   This step:
+      #     a) Counts how many unprocessed items remain
+      #     b) Picks the next URL_LIMIT items from that queue
+      #     c) Appends one line to series_json.txt recording the
+      #        serial_no values picked in this exact batch, e.g.:
+      #
+      #        [Run 3 | 2025-07-18 10:42 UTC] serial_no range: 21–30
+      #        Picked serial_nos: 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
+      #
+      - name: Check remaining items + write range tracker
+        id: check_remaining
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+          from datetime import datetime, timezone
+
+          TARGET_JSON    = "series.json"
+          PROCESSED_FILE = "list_of_already_processed_urls.txt"
+          RANGE_FILE     = "series_json.txt"
+          URL_LIMIT      = 10
+
+          # ── guard: JSON must exist ──────────────────────────────────
+          if not os.path.exists(TARGET_JSON):
+              print(f"[!] {TARGET_JSON} not found — nothing to do.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("remaining=0\n")
+              sys.exit(0)
+
+          # ── load already-processed URLs ────────────────────────────
+          processed = set()
+          if os.path.exists(PROCESSED_FILE):
+              with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
+                  processed = {line.strip() for line in f if line.strip()}
+
+          # ── load JSON ──────────────────────────────────────────────
+          with open(TARGET_JSON, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          def already_done(item):
+              return bool(item.get("episode-1-server1", ""))
+
+          # ── full remaining queue (not yet processed) ───────────────
+          remaining = [
+              item for item in data
+              if item.get("url")
+              and not already_done(item)
+              and item["url"] not in processed
+          ]
+
+          print(f"[check] {len(remaining)} item(s) still need processing.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"remaining={len(remaining)}\n")
+
+          if not remaining:
+              sys.exit(0)
+
+          # ── determine which items will be taken THIS batch ─────────
+          batch = remaining[:URL_LIMIT]
+
+          # Collect serial_no values; fall back to list-position if absent
+          serial_nos = []
+          for item in batch:
+              sno = item.get("serial_no")
+              if sno is not None:
+                  serial_nos.append(str(sno))
+              else:
+                  # derive from item's position in the full data list
+                  try:
+                      idx = data.index(item) + 1   # 1-based
+                      serial_nos.append(f"(pos {idx})")
+                  except ValueError:
+                      serial_nos.append("?")
+
+          # ── figure out run number from existing range file ─────────
+          run_number = 1
+          if os.path.exists(RANGE_FILE):
+              with open(RANGE_FILE, "r", encoding="utf-8") as f:
+                  content = f.read().strip()
+              if content:
+                  # count lines that start with "[Run"
+                  run_number = sum(
+                      1 for ln in content.splitlines()
+                      if ln.startswith("[Run")
+                  ) + 1
+
+          # ── build the range string ─────────────────────────────────
+          if serial_nos:
+              first, last = serial_nos[0], serial_nos[-1]
+              range_str = f"{first}–{last}" if first != last else first
+          else:
+              range_str = "N/A"
+
+          now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          picked_str = ", ".join(serial_nos)
+
+          log_line = (
+              f"[Run {run_number} | {now_utc}] serial_no range: {range_str}\n"
+              f"  Picked serial_nos : {picked_str}\n"
+              f"  Items in batch    : {len(batch)}\n"
+              f"  Total remaining   : {len(remaining)}\n"
+          )
+
+          with open(RANGE_FILE, "a", encoding="utf-8") as f:
+              f.write(log_line + "\n")
+
+          print(f"[range] Logged batch info to {RANGE_FILE}:")
+          print(log_line)
+          PYEOF
+
+      # ── 5. Run the scraper (only when items remain) ────────────────
       - name: Run Scraper
+        if: steps.check_remaining.outputs.remaining != '0'
         env:
-          # Passes the chosen dropdown option (or default) to Python
-          TARGET_JSON: ${{ github.event.inputs.target_json || 'movies.json' }}
-          URL_LIMIT: ${{ github.event.inputs.url_limit || '100' }}
+          TARGET_JSON: ${{ env.TARGET_JSON }}
+          URL_LIMIT:   ${{ env.URL_LIMIT }}
         run: python server_collector_with_tmdb_imdb.py
 
+      # ── 6. Commit & push results + both tracking files ─────────────
       - name: Commit and Push Changes
+        if: steps.check_remaining.outputs.remaining != '0'
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          
-          # Stage all changed or newly created files (.json and .txt)
-          git add .
-          
-          # Commit only if there are changes
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update $TARGET_JSON (limit: $URL_LIMIT URLs)"
-          
-          # Push to the main branch
+          git config --local user.name  "github-actions[bot]"
+
+          git add series.json \
+                  list_of_already_processed_urls.txt \
+                  list_of_facing_error.txt \
+                  series_json.txt 2>/dev/null || true
+
+          git diff --staged --quiet \
+            || git commit -m "Auto-update series.json — batch of ${{ env.URL_LIMIT }} items (range logged in series_json.txt)"
+
           git push
+
+      # ── 7. Count remaining items AFTER saving ─────────────────────
+      - name: Count remaining after save
+        if: steps.check_remaining.outputs.remaining != '0'
+        id: count_after
+        run: |
+          python - <<'PYEOF'
+          import json, os
+
+          TARGET_JSON    = "series.json"
+          PROCESSED_FILE = "list_of_already_processed_urls.txt"
+
+          processed = set()
+          if os.path.exists(PROCESSED_FILE):
+              with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
+                  processed = {line.strip() for line in f if line.strip()}
+
+          with open(TARGET_JSON, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          def already_done(item):
+              return bool(item.get("episode-1-server1", ""))
+
+          remaining = [
+              item for item in data
+              if item.get("url")
+              and not already_done(item)
+              and item["url"] not in processed
+          ]
+
+          print(f"[after] {len(remaining)} item(s) still left after this batch.")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"remaining_after={len(remaining)}\n")
+          PYEOF
+
+      # ── 8. Wait 5 minutes then re-trigger (if items remain) ───────
+      - name: Schedule next batch in 5 minutes
+        if: >
+          steps.check_remaining.outputs.remaining != '0' &&
+          steps.count_after.outputs.remaining_after != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[scheduler] Sleeping 5 minutes before re-triggering..."
+          sleep 300
+
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d '{"event_type":"series_auto_continue","client_payload":{"triggered_by":"auto"}}' \
+          && echo "[scheduler] Next batch triggered successfully." \
+          || echo "[scheduler] WARNING: failed to trigger next batch — check token permissions."
+
+      # ── 9. Final status banner ─────────────────────────────────────
+      - name: Print completion status
+        if: always()
+        run: |
+          if [ "${{ steps.check_remaining.outputs.remaining }}" = "0" ]; then
+            echo "======================================================"
+            echo "  ALL items in series.json have been processed!"
+            echo "  No further runs will be triggered automatically."
+            echo "  Check series_json.txt for the full run history."
+            echo "======================================================"
+          elif [ "${{ steps.count_after.outputs.remaining_after }}" = "0" ]; then
+            echo "======================================================"
+            echo "  Last batch complete — series.json fully done!"
+            echo "  Check series_json.txt for the full run history."
+            echo "======================================================"
+          else
+            echo "------------------------------------------------------"
+            echo "  Batch finished. Next run starts in ~5 minutes."
+            echo "  Remaining: ${{ steps.count_after.outputs.remaining_after }} items."
+            echo "  Range log: series_json.txt"
+            echo "------------------------------------------------------"
+          fi
