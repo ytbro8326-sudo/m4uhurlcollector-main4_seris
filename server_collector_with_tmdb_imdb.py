@@ -1,209 +1,673 @@
-name: Series Collector — Auto-Paginate (10 items / run)
+import re
+import sys
+import json
+import os
+import time
+import random
+import threading
+import requests
+import urllib3
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+from collections import deque
 
-on:
-  # ── Manual kick-off (first time) ──────────────────────────────────
-  workflow_dispatch:
-    inputs:
-      force_restart:
-        description: 'Clear processed-URL log and restart from the beginning?'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-  # ── Self-triggered re-runs arrive here via repository_dispatch ────
-  repository_dispatch:
-    types: [series_auto_continue]
+# ── API Configurations ───────────────────────────────────────────
+TMDB_API_KEY = "6fad3f86b8452ee232deb7977d7dcf58"
 
-# Allow the bot to push JSON changes AND trigger new workflow runs
-permissions:
-  contents: write
-  actions: write          # needed to call the Actions API for re-dispatch
+TARGET_JSON    = os.getenv("TARGET_JSON", "movies.json")
+PROCESSED_FILE = "list_of_already_processed_urls.txt"
+ERROR_FILE     = "list_of_facing_error.txt"
 
-env:
-  TARGET_JSON: "series.json"
-  URL_LIMIT:   "10"
+IS_SERIES = "series" in TARGET_JSON.lower()
 
-jobs:
-  scrape-and-continue:
-    runs-on: ubuntu-latest
+HTTPS_TEST_URL = "https://ww1.m4uhd.page/"
 
-    steps:
-      # ── 1. Checkout ────────────────────────────────────────────────
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+def parse_url_limit():
+    raw = os.getenv("URL_LIMIT", "100").strip().lower()
+    if raw == "full":
+        return None
+    try:
+        val = int(raw)
+        return val if val > 0 else 100
+    except ValueError:
+        print(f"[!] Invalid URL_LIMIT value '{raw}'. Defaulting to 100.")
+        return 100
 
-      # ── 2. Optional hard-reset (only when manually requested) ──────
-      - name: Clear processed log (force_restart only)
-        if: >
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.force_restart == 'true'
-        run: |
-          echo "[reset] Clearing list_of_already_processed_urls.txt"
-          > list_of_already_processed_urls.txt
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name  "github-actions[bot]"
-          git add list_of_already_processed_urls.txt
-          git diff --staged --quiet || git commit -m "Reset: cleared processed-URL log for series.json"
-          git push
+URL_LIMIT = parse_url_limit()
 
-      # ── 3. Python setup ────────────────────────────────────────────
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests curl-cffi beautifulsoup4
+# ══════════════════════════════════════════════════════════════════
+#  FREE PROXY SCRAPER
+# ══════════════════════════════════════════════════════════════════
 
-      # ── 4. Count how many items are left BEFORE running ───────────
-      #       If zero remain, skip scraping and skip the re-trigger.
-      - name: Check remaining items
-        id: check_remaining
-        run: |
-          python - <<'PYEOF'
-          import json, os, sys
+def scrape_free_proxies():
+    proxies = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-          TARGET_JSON    = "series.json"
-          PROCESSED_FILE = "list_of_already_processed_urls.txt"
+    try:
+        r = requests.get("https://free-proxy-list.net/", headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table")
+        if table:
+            for row in table.find_all("tr")[1:]:
+                cols = row.find_all("td")
+                if len(cols) >= 7:
+                    ip     = cols[0].text.strip()
+                    port   = cols[1].text.strip()
+                    https  = cols[6].text.strip().lower()
+                    scheme = "https" if https == "yes" else "http"
+                    proxies.append(f"{scheme}://{ip}:{port}")
+        print(f"  [+] free-proxy-list.net  : {len(proxies)} proxies")
+    except Exception as e:
+        print(f"  [-] free-proxy-list.net failed : {e}")
 
-          if not os.path.exists(TARGET_JSON):
-              print(f"[!] {TARGET_JSON} not found — nothing to do.")
-              print("remaining=0")
-              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-                  fh.write("remaining=0\n")
-              sys.exit(0)
+    count_before = len(proxies)
+    try:
+        r = requests.get("https://www.sslproxies.org/", headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table")
+        if table:
+            for row in table.find_all("tr")[1:]:
+                cols = row.find_all("td")
+                if len(cols) >= 2:
+                    ip   = cols[0].text.strip()
+                    port = cols[1].text.strip()
+                    proxies.append(f"https://{ip}:{port}")
+        print(f"  [+] sslproxies.org       : {len(proxies) - count_before} proxies")
+    except Exception as e:
+        print(f"  [-] sslproxies.org failed : {e}")
 
-          processed = set()
-          if os.path.exists(PROCESSED_FILE):
-              with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
-                  processed = {line.strip() for line in f if line.strip()}
+    count_before = len(proxies)
+    try:
+        url = (
+            "https://api.proxyscrape.com/v2/?request=displayproxies"
+            "&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all"
+        )
+        r = requests.get(url, headers=headers, timeout=10)
+        for line in r.text.strip().splitlines():
+            line = line.strip()
+            if ":" in line:
+                proxies.append(f"http://{line}")
+        print(f"  [+] proxyscrape API      : {len(proxies) - count_before} proxies")
+    except Exception as e:
+        print(f"  [-] proxyscrape API failed : {e}")
 
-          with open(TARGET_JSON, "r", encoding="utf-8") as f:
-              data = json.load(f)
+    count_before = len(proxies)
+    try:
+        url = (
+            "https://proxylist.geonode.com/api/proxy-list"
+            "?limit=100&page=1&sort_by=lastChecked&sort_type=desc&protocols=http,https"
+        )
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        for entry in data.get("data", []):
+            ip       = entry.get("ip", "")
+            port     = entry.get("port", "")
+            protocol = entry.get("protocols", ["http"])[0]
+            if ip and port:
+                proxies.append(f"{protocol}://{ip}:{port}")
+        print(f"  [+] geonode API          : {len(proxies) - count_before} proxies")
+    except Exception as e:
+        print(f"  [-] geonode API failed : {e}")
 
-          # Series "done" check: same logic as series_already_done() in the script
-          def already_done(item):
-              return bool(item.get("episode-1-server1", ""))
+    proxies = list(dict.fromkeys(proxies))
+    print(f"\n  [*] Total unique proxies scraped: {len(proxies)}")
+    return proxies
 
-          remaining = [
-              item for item in data
-              if item.get("url")
-              and not already_done(item)
-              and item["url"] not in processed
-          ]
 
-          print(f"[check] {len(remaining)} item(s) still need processing.")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"remaining={len(remaining)}\n")
-          PYEOF
+# ══════════════════════════════════════════════════════════════════
+#  PROXY POOL
+# ══════════════════════════════════════════════════════════════════
 
-      # ── 5. Run the scraper (only when items remain) ────────────────
-      - name: Run Scraper
-        if: steps.check_remaining.outputs.remaining != '0'
-        env:
-          TARGET_JSON: ${{ env.TARGET_JSON }}
-          URL_LIMIT:   ${{ env.URL_LIMIT }}
-        run: python server_collector_with_tmdb_imdb.py
+class ProxyPool:
+    def __init__(self, proxies, test_url=HTTPS_TEST_URL, timeout=10):
+        self._all      = proxies
+        self._live     = deque()
+        self._lock     = threading.Lock()
+        self._test_url = test_url
+        self._timeout  = timeout
+        self._validate_all()
 
-      # ── 6. Commit & push results ───────────────────────────────────
-      - name: Commit and Push Changes
-        if: steps.check_remaining.outputs.remaining != '0'
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name  "github-actions[bot]"
+    def _validate_all(self):
+        print(f"\n[*] Validating {len(self._all)} proxies against {self._test_url} ...")
+        threads = []
+        for p in self._all:
+            t = threading.Thread(target=self._check, args=(p,))
+            t.daemon = True
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=self._timeout + 3)
+        print(f"[*] {len(self._live)} / {len(self._all)} proxies can tunnel HTTPS to target.")
+        if not self._live:
+            raise RuntimeError("[!] No live proxies found that support HTTPS tunneling to the target.")
 
-          # Stage JSON data + both tracking files
-          git add series.json \
-                  list_of_already_processed_urls.txt \
-                  list_of_facing_error.txt 2>/dev/null || true
+    def _check(self, proxy_url):
+        try:
+            r = requests.get(
+                self._test_url,
+                proxies={"http": proxy_url, "https": proxy_url},
+                timeout=self._timeout,
+                verify=False,
+                allow_redirects=True,
+            )
+            # Only accept proxies where the site returns 200
+            # 403 means site blocked the proxy IP — useless for scraping
+            if r.status_code == 200:
+                with self._lock:
+                    self._live.append(proxy_url)
+                print(f"  [+] Live [200] : {proxy_url}")
+        except Exception:
+            pass
 
-          git diff --staged --quiet \
-            || git commit -m "Auto-update series.json — batch of ${{ env.URL_LIMIT }} items"
+    def next(self):
+        with self._lock:
+            if not self._live:
+                raise RuntimeError("[!] Proxy pool is empty.")
+            proxy = self._live.popleft()
+            self._live.append(proxy)
+            return proxy
 
-          git push
+    def remove(self, proxy_url):
+        with self._lock:
+            try:
+                self._live.remove(proxy_url)
+                print(f"  [x] Removed dead proxy: {proxy_url} | Remaining: {len(self._live)}")
+            except ValueError:
+                pass
 
-      # ── 7. Count remaining items AFTER saving ─────────────────────
-      - name: Count remaining after save
-        if: steps.check_remaining.outputs.remaining != '0'
-        id: count_after
-        run: |
-          python - <<'PYEOF'
-          import json, os
+    def size(self):
+        with self._lock:
+            return len(self._live)
 
-          TARGET_JSON    = "series.json"
-          PROCESSED_FILE = "list_of_already_processed_urls.txt"
+    def is_empty(self):
+        with self._lock:
+            return len(self._live) == 0
 
-          processed = set()
-          if os.path.exists(PROCESSED_FILE):
-              with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
-                  processed = {line.strip() for line in f if line.strip()}
+    def refill(self):
+        print("\n[!] Pool running low — re-scraping fresh proxies...")
+        new_proxies = scrape_free_proxies()
+        print(f"[*] Validating {len(new_proxies)} candidates against {self._test_url} ...")
+        found = []
+        lock  = threading.Lock()
 
-          with open(TARGET_JSON, "r", encoding="utf-8") as f:
-              data = json.load(f)
+        def _check_new(proxy_url):
+            try:
+                r = requests.get(
+                    self._test_url,
+                    proxies={"http": proxy_url, "https": proxy_url},
+                    timeout=self._timeout,
+                    verify=False,
+                    allow_redirects=True,
+                )
+                if r.status_code == 200:
+                    with lock:
+                        found.append(proxy_url)
+            except Exception:
+                pass
 
-          def already_done(item):
-              return bool(item.get("episode-1-server1", ""))
+        threads = [threading.Thread(target=_check_new, args=(p,)) for p in new_proxies]
+        for t in threads:
+            t.daemon = True
+            t.start()
+        for t in threads:
+            t.join(timeout=self._timeout + 3)
 
-          remaining = [
-              item for item in data
-              if item.get("url")
-              and not already_done(item)
-              and item["url"] not in processed
-          ]
+        added = 0
+        with self._lock:
+            existing = set(self._live)
+            for p in found:
+                if p not in existing:
+                    self._live.append(p)
+                    added += 1
 
-          print(f"[after] {len(remaining)} item(s) still left after this batch.")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"remaining_after={len(remaining)}\n")
-          PYEOF
+        print(f"[*] Refill complete. Added {added} new proxies. Pool size: {self.size()}")
 
-      # ── 8. Wait 5 minutes then re-trigger (if items remain) ───────
-      #
-      #   We use repository_dispatch instead of workflow_dispatch
-      #   because the latter cannot be programmatically triggered on
-      #   the default branch without a PAT when "permissions: actions"
-      #   is given; repository_dispatch works with GITHUB_TOKEN.
-      #
-      - name: Schedule next batch in 5 minutes
-        if: >
-          steps.check_remaining.outputs.remaining != '0' &&
-          steps.count_after.outputs.remaining_after != '0'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "[scheduler] Sleeping 5 minutes before re-triggering..."
-          sleep 300
 
-          # Fire repository_dispatch — the workflow listens on type 'series_auto_continue'
-          curl -s -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-            -d '{"event_type":"series_auto_continue","client_payload":{"triggered_by":"auto"}}' \
-          && echo "[scheduler] Next batch triggered successfully." \
-          || echo "[scheduler] WARNING: failed to trigger next batch — check token permissions."
+# ══════════════════════════════════════════════════════════════════
+#  SESSION + PROXY HELPERS
+# ══════════════════════════════════════════════════════════════════
 
-      # ── 9. Final status banner ─────────────────────────────────────
-      - name: Print completion status
-        if: always()
-        run: |
-          if [ "${{ steps.check_remaining.outputs.remaining }}" = "0" ]; then
-            echo "======================================================"
-            echo "  ✅  ALL items in series.json have been processed!"
-            echo "  No further runs will be triggered automatically."
-            echo "======================================================"
-          elif [ "${{ steps.count_after.outputs.remaining_after }}" = "0" ]; then
-            echo "======================================================"
-            echo "  ✅  Last batch complete — series.json fully done!"
-            echo "======================================================"
-          else
-            echo "------------------------------------------------------"
-            echo "  ⏳  Batch finished. Next run starts in ~5 minutes."
-            echo "  Remaining: ${{ steps.count_after.outputs.remaining_after }} items."
-            echo "------------------------------------------------------"
-          fi
+S = requests.Session()
+S.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "X-Requested-With": "XMLHttpRequest"
+})
+
+_current_proxy = {"url": None}
+pool = None
+
+
+def set_new_proxy():
+    if pool.size() < 5:
+        pool.refill()
+    _current_proxy["url"] = pool.next()
+    S.proxies.update({
+        "http":  _current_proxy["url"],
+        "https": _current_proxy["url"]
+    })
+    print(f"  [*] Rotating IP... Now using proxy: {_current_proxy['url']}")
+
+
+def report_bad_proxy():
+    if _current_proxy["url"]:
+        pool.remove(_current_proxy["url"])
+    if pool.is_empty():
+        pool.refill()
+    set_new_proxy()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FILE I/O HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def init_files():
+    if not os.path.exists(PROCESSED_FILE):
+        open(PROCESSED_FILE, "w", encoding="utf-8").close()
+    if not os.path.exists(ERROR_FILE):
+        open(ERROR_FILE, "w", encoding="utf-8").close()
+    with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f if line.strip())
+
+def log_processed(url):
+    with open(PROCESSED_FILE, "a", encoding="utf-8") as f:
+        f.write(url + "\n")
+
+def log_error(url, error_msg):
+    with open(ERROR_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{url} | ERROR: {error_msg}\n")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TMDB LOOKUP
+# ══════════════════════════════════════════════════════════════════
+
+def get_tmdb_id_from_imdb(imdb_id):
+    if not TMDB_API_KEY:
+        return ""
+    url = f"https://api.themoviedb.org/3/find/{imdb_id}?api_key={TMDB_API_KEY}&external_source=imdb_id"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("movie_results"):
+            return str(data["movie_results"][0]["id"])
+        elif data.get("tv_results"):
+            return str(data["tv_results"][0]["id"])
+    except Exception as e:
+        print(f"  [!] Failed to fetch TMDb ID for {imdb_id}: {e}")
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HTML HELPERS — with debug prints to expose silent failures
+# ══════════════════════════════════════════════════════════════════
+
+def base(url):
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}"
+
+def csrf(html):
+    m = re.search(r'<meta name="csrf-token" content="([^"]+)"', html)
+    token = m.group(1) if m else ""
+    if not token:
+        print("  [DEBUG] WARNING: csrf-token NOT found in page HTML")
+    else:
+        print(f"  [DEBUG] csrf-token found: {token[:20]}...")
+    return token
+
+def spans(html):
+    soup = BeautifulSoup(html, "html.parser")
+    all_spans_with_data = soup.find_all("span", attrs={"data": True})
+    valid = [
+        (s.get_text(strip=True), s["data"])
+        for s in all_spans_with_data
+        if len(s.get("data", "")) > 10
+    ]
+    print(f"  [DEBUG] spans() — total <span data=...> found: {len(all_spans_with_data)}, valid (len>10): {len(valid)}")
+    if not valid:
+        # Show a snippet of the raw HTML to see what the page actually looks like
+        snippet = html[:2000].replace("\n", " ")
+        print(f"  [DEBUG] Page HTML snippet (first 2000 chars):\n{snippet}\n")
+    return valid
+
+def iframe(html):
+    m = re.search(r'<iframe[^>]+src="([^"]+)"', html)
+    url = m.group(1) if m else ""
+    if not url:
+        print(f"  [DEBUG] iframe() — no <iframe src=...> found. Response snippet: {html[:500]}")
+    else:
+        print(f"  [DEBUG] iframe() — found embed URL: {url[:80]}")
+    return url
+
+def post(url, data, ref):
+    r = S.post(
+        url, data=data,
+        headers={"Referer": ref, "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=15,
+        verify=False
+    )
+    r.raise_for_status()
+    return r.text
+
+
+# ══════════════════════════════════════════════════════════════════
+#  EPISODE HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def fetch_servers_for_episode(root, token, ep_id, target_url, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            time.sleep(random.uniform(1.5, 3.0))
+            server_html = post(
+                f"{root}/ajaxtv",
+                {"idepisode": ep_id, "_token": token},
+                target_url
+            )
+            servers = spans(server_html)
+            embeds  = []
+            for label, data in servers:
+                embed_html = post(
+                    f"{root}/ajax",
+                    {"m4u": data, "_token": token},
+                    target_url
+                )
+                url = iframe(embed_html)
+                if url:
+                    embeds.append(url)
+            return embeds
+
+        except requests.exceptions.RequestException as e:
+            print(f"    [!] Episode {ep_id} attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                report_bad_proxy()
+            else:
+                print(f"    [!] Giving up on episode {ep_id}.")
+                return []
+        except Exception as e:
+            print(f"    [!] Unexpected error on episode {ep_id}: {e}")
+            return []
+
+
+def get_all_episode_ids(html):
+    seen    = set()
+    ordered = []
+    for ep_id in re.findall(r'idepisode=["\'](\w+)["\']', html):
+        if ep_id not in seen:
+            seen.add(ep_id)
+            ordered.append(ep_id)
+    return ordered
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN EXTRACTION: MOVIES
+# ══════════════════════════════════════════════════════════════════
+
+def extract_movie_servers(target_url, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            time.sleep(random.uniform(2.5, 5.0))
+            print(f"  [DEBUG] Fetching page: {target_url}")
+            r = S.get(target_url, timeout=15, verify=False)
+            print(f"  [DEBUG] Page status code: {r.status_code}")
+            html    = r.text
+            token   = csrf(html)
+            root    = base(target_url)
+            servers = spans(html)
+
+            if not servers:
+                print(f"  [DEBUG] No servers found in page — skipping AJAX calls")
+                log_error(target_url, "spans() returned empty — page structure may have changed")
+                return []
+
+            embeds = []
+            for label, data in servers:
+                print(f"  [DEBUG] POSTing to /ajax for server label='{label}' data='{data[:30]}...'")
+                try:
+                    embed_html = post(f"{root}/ajax", {"m4u": data, "_token": token}, target_url)
+                    url = iframe(embed_html)
+                    if url:
+                        embeds.append(url)
+                except Exception as e:
+                    print(f"  [DEBUG] /ajax POST failed for label='{label}': {e}")
+
+            return embeds
+
+        except requests.exceptions.RequestException as e:
+            print(f"  [!] Attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                report_bad_proxy()
+            else:
+                log_error(target_url, f"Failed after {max_retries} retries: {str(e)}")
+                return []
+        except Exception as e:
+            print(f"  [!] Unexpected error: {e}")
+            log_error(target_url, f"Unexpected error: {str(e)}")
+            return []
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN EXTRACTION: SERIES
+# ══════════════════════════════════════════════════════════════════
+
+def extract_series_all_episodes(target_url, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            time.sleep(random.uniform(2.5, 5.0))
+            print(f"  [DEBUG] Fetching series page: {target_url}")
+            r = S.get(target_url, timeout=15, verify=False)
+            print(f"  [DEBUG] Page status code: {r.status_code}")
+            html  = r.text
+            token = csrf(html)
+            root  = base(target_url)
+            break
+
+        except requests.exceptions.RequestException as e:
+            print(f"  [!] Page load attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                report_bad_proxy()
+            else:
+                log_error(target_url, f"Series page load failed after {max_retries} retries: {str(e)}")
+                return None
+        except Exception as e:
+            log_error(target_url, f"Unexpected error loading series page: {str(e)}")
+            return None
+
+    ep_ids = get_all_episode_ids(html)
+    print(f"  [DEBUG] Episode IDs found: {ep_ids[:5]}{'...' if len(ep_ids) > 5 else ''}")
+    if not ep_ids:
+        log_error(target_url, "No episode IDs found on series page.")
+        return None
+
+    print(f"  [*] Found {len(ep_ids)} episodes to process.")
+
+    result = {
+        "total_episodes": len(ep_ids),
+        "episodes": {},
+        "imdb_id": ""
+    }
+
+    for ep_num, ep_id in enumerate(ep_ids, start=1):
+        print(f"    -> Episode {ep_num}/{len(ep_ids)} (id={ep_id})")
+        embeds = fetch_servers_for_episode(root, token, ep_id, target_url)
+
+        if embeds:
+            result["episodes"][str(ep_num)] = embeds
+            if not result["imdb_id"]:
+                for embed_url in embeds:
+                    match = re.search(r'(tt\d{7,10})', embed_url)
+                    if match:
+                        result["imdb_id"] = match.group(1)
+                        break
+            print(f"       Got {len(embeds)} server(s).")
+        else:
+            result["episodes"][str(ep_num)] = []
+            print(f"       No servers found for episode {ep_num}.")
+
+        time.sleep(random.uniform(1.0, 2.0))
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  APPLY SERIES RESULT
+# ══════════════════════════════════════════════════════════════════
+
+def apply_series_result(item, series_data):
+    for k in ["server1", "server2", "server3", "server4"]:
+        item.pop(k, None)
+    item["total_episodes"] = series_data["total_episodes"]
+    for ep_num_str, embeds in series_data["episodes"].items():
+        for server_idx, embed_url in enumerate(embeds, start=1):
+            key = f"episode-{ep_num_str}-server{server_idx}"
+            item[key] = embed_url
+
+def series_already_done(item):
+    return bool(item.get("episode-1-server1", ""))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DETECT TARGET HOST FROM JSON
+# ══════════════════════════════════════════════════════════════════
+
+def detect_target_host(json_path):
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for item in data:
+            url = item.get("url", "")
+            if url.startswith("https://"):
+                p = urlparse(url)
+                return f"{p.scheme}://{p.netloc}/"
+    except Exception:
+        pass
+    return HTTPS_TEST_URL
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════
+
+def main():
+    global pool
+
+    limit_label = "full (no limit)" if URL_LIMIT is None else str(URL_LIMIT)
+    print(f"[*] Starting job for file : {TARGET_JSON}")
+    print(f"[*] Mode                  : {'SERIES' if IS_SERIES else 'MOVIES'}")
+    print(f"[*] URL limit             : {limit_label}")
+
+    if not os.path.exists(TARGET_JSON):
+        print(f"[!] Error: {TARGET_JSON} not found in repository.")
+        sys.exit(1)
+
+    test_url = detect_target_host(TARGET_JSON)
+    print(f"[*] Proxy test URL        : {test_url}")
+
+    print("\n[*] Scraping free proxies...")
+    raw_proxies = scrape_free_proxies()
+    pool = ProxyPool(raw_proxies, test_url=test_url)
+    set_new_proxy()
+
+    processed_urls = init_files()
+
+    with open(TARGET_JSON, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    print(f"\n[*] Total records in {TARGET_JSON}: {len(data)}")
+
+    if IS_SERIES:
+        queue = [
+            item for item in data
+            if item.get("url")
+            and not series_already_done(item)
+            and item["url"] not in processed_urls
+        ]
+    else:
+        queue = [
+            item for item in data
+            if item.get("url")
+            and not item.get("server1")
+            and item["url"] not in processed_urls
+        ]
+
+    if URL_LIMIT is not None:
+        queue = queue[:URL_LIMIT]
+
+    print(f"[*] Items queued for this run: {len(queue)}")
+
+    try:
+        for item in queue:
+            if pool.size() < 5:
+                pool.refill()
+
+            target_url = item["url"]
+            print(f"\n-> Processing: {item.get('title', 'Unknown Title')}")
+            print(f"   URL: {target_url}")
+
+            try:
+                if IS_SERIES:
+                    series_data = extract_series_all_episodes(target_url)
+
+                    if not series_data:
+                        log_error(target_url, "Series extraction returned nothing.")
+                        continue
+
+                    apply_series_result(item, series_data)
+
+                    found_imdb_id = series_data.get("imdb_id", "")
+                    if found_imdb_id:
+                        item["imdb_id"] = found_imdb_id
+                        print(f"   Found IMDb ID : {found_imdb_id}")
+                        tmdb_id = get_tmdb_id_from_imdb(found_imdb_id)
+                        if tmdb_id:
+                            item["tmdb_id"] = tmdb_id
+                            print(f"   Fetched TMDb ID: {tmdb_id}")
+
+                    print(f"   Done — {series_data['total_episodes']} episodes written.")
+
+                else:
+                    embeds = extract_movie_servers(target_url)
+
+                    if not embeds:
+                        log_error(target_url, "No embeds found or extraction failed.")
+                        continue
+
+                    for i in range(1, 5):
+                        item[f"server{i}"] = embeds[i - 1] if i <= len(embeds) else ""
+
+                    found_imdb_id = ""
+                    for url in embeds:
+                        match = re.search(r'(tt\d{7,10})', url)
+                        if match:
+                            found_imdb_id = match.group(1)
+                            break
+
+                    if found_imdb_id:
+                        item["imdb_id"] = found_imdb_id
+                        print(f"   Found IMDb ID : {found_imdb_id}")
+                        tmdb_id = get_tmdb_id_from_imdb(found_imdb_id)
+                        if tmdb_id:
+                            item["tmdb_id"] = tmdb_id
+                            print(f"   Fetched TMDb ID: {tmdb_id}")
+
+                    print(f"   Processed and mapped {len(embeds)} servers.")
+
+                processed_urls.add(target_url)
+                log_processed(target_url)
+
+            except Exception as e:
+                print(f"  [!] Error processing item: {e}")
+                log_error(target_url, f"Item processing crashed: {str(e)}")
+
+    except KeyboardInterrupt:
+        print("\n[!] Script manually interrupted. Saving JSON...")
+    finally:
+        with open(TARGET_JSON, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        print(f"\n[*] Saved updates to {TARGET_JSON}.")
+
+
+if __name__ == "__main__":
+    main()
