@@ -23,3 +23,8 @@
   Items in batch    : 10
   Total remaining   : 4940
 
+[Run 6 | 2026-08-01 00:25 UTC] serial_no range: 71–80
+  Picked serial_nos : 71, 72, 73, 74, 75, 76, 77, 78, 79, 80
+  Items in batch    : 10
+  Total remaining   : 4930
+
