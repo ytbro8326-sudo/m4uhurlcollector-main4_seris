@@ -1,0 +1,193 @@
+name: Series Collector — Manual Serial Numbers
+
+on:
+  workflow_dispatch:
+    inputs:
+      serial_nos:
+        description: >
+          Comma-separated serial_no values to process.
+          Example: 180, 183, 205, 210
+        required: true
+        type: string
+
+      target_json:
+        description: 'JSON file to operate on'
+        required: false
+        default: 'series.json'
+        type: string
+
+      force_reprocess:
+        description: 'Re-process even if already done?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+env:
+  TARGET_JSON: ${{ github.event.inputs.target_json || 'series.json' }}
+
+jobs:
+  scrape-manual:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests curl-cffi beautifulsoup4
+
+      # ── 3. Validate + preview the requested serial numbers ─────────
+      - name: Preview items to be scraped
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+
+          TARGET_JSON   = os.environ["TARGET_JSON"]
+          SERIAL_NOS    = os.environ.get("SERIAL_NOS", "")
+          FORCE         = os.environ.get("FORCE_REPROCESS", "false").lower() == "true"
+          PROCESSED_FILE = "list_of_already_processed_urls.txt"
+
+          if not os.path.exists(TARGET_JSON):
+              print(f"[!] {TARGET_JSON} not found.")
+              sys.exit(1)
+
+          # Parse requested serials
+          try:
+              requested = {int(x.strip()) for x in SERIAL_NOS.split(",") if x.strip()}
+          except ValueError as e:
+              print(f"[!] Bad SERIAL_NOS value: {e}")
+              sys.exit(1)
+
+          if not requested:
+              print("[!] No serial numbers provided.")
+              sys.exit(1)
+
+          # Load processed URLs
+          processed = set()
+          if os.path.exists(PROCESSED_FILE):
+              with open(PROCESSED_FILE, encoding="utf-8") as f:
+                  processed = {ln.strip() for ln in f if ln.strip()}
+
+          with open(TARGET_JSON, encoding="utf-8") as f:
+              data = json.load(f)
+
+          sno_to_item = {item["serial_no"]: item for item in data if "serial_no" in item}
+
+          print(f"\n{'='*60}")
+          print(f"  Manual scrape preview — {TARGET_JSON}")
+          print(f"{'='*60}")
+          found, missing = [], []
+          for sno in sorted(requested):
+              item = sno_to_item.get(sno)
+              if item is None:
+                  missing.append(sno)
+                  continue
+              already = bool(item.get("episode-1-server1", "") or item.get("server1", ""))
+              skip_reason = ""
+              if already and not FORCE:
+                  skip_reason = " [SKIP — already done; use force_reprocess=true to override]"
+              elif item["url"] in processed and not FORCE:
+                  skip_reason = " [SKIP — URL in processed log]"
+              print(f"  #{sno:>4}  {item.get('title','?'):<40}  {skip_reason}")
+              found.append(sno)
+
+          if missing:
+              print(f"\n  [!] serial_no(s) NOT found in JSON: {missing}")
+
+          print(f"\n  Found: {len(found)} | Missing: {len(missing)}")
+          print(f"{'='*60}\n")
+          PYEOF
+        env:
+          SERIAL_NOS:       ${{ github.event.inputs.serial_nos }}
+          FORCE_REPROCESS:  ${{ github.event.inputs.force_reprocess }}
+
+      # ── 4. Optionally clear processed log for these URLs ──────────
+      #    (only when force_reprocess=true, so they run again)
+      - name: Remove target URLs from processed log (force_reprocess)
+        if: github.event.inputs.force_reprocess == 'true'
+        run: |
+          python - <<'PYEOF'
+          import json, os
+
+          TARGET_JSON  = os.environ["TARGET_JSON"]
+          SERIAL_NOS   = os.environ.get("SERIAL_NOS", "")
+          PROCESSED_FILE = "list_of_already_processed_urls.txt"
+
+          requested = {int(x.strip()) for x in SERIAL_NOS.split(",") if x.strip()}
+
+          if not os.path.exists(TARGET_JSON) or not os.path.exists(PROCESSED_FILE):
+              print("[i] Nothing to clear.")
+          else:
+              with open(TARGET_JSON, encoding="utf-8") as f:
+                  data = json.load(f)
+              target_urls = {
+                  item["url"]
+                  for item in data
+                  if item.get("serial_no") in requested and item.get("url")
+              }
+
+              with open(PROCESSED_FILE, encoding="utf-8") as f:
+                  lines = [ln.strip() for ln in f if ln.strip()]
+
+              kept = [ln for ln in lines if ln not in target_urls]
+              removed = len(lines) - len(kept)
+
+              with open(PROCESSED_FILE, "w", encoding="utf-8") as f:
+                  f.write("\n".join(kept) + ("\n" if kept else ""))
+
+              print(f"[force_reprocess] Removed {removed} URL(s) from processed log.")
+        env:
+          SERIAL_NOS: ${{ github.event.inputs.serial_nos }}
+
+      # ── 5. Run the scraper with SERIAL_NOS filter ──────────────────
+      - name: Run Scraper (manual serial filter)
+        env:
+          TARGET_JSON:  ${{ env.TARGET_JSON }}
+          SERIAL_NOS:   ${{ github.event.inputs.serial_nos }}
+          # URL_LIMIT is intentionally omitted — serial filter takes precedence
+        run: python server_collector_with_tmdb_imdb.py
+
+      # ── 6. Commit & push results ───────────────────────────────────
+      - name: Commit and Push Changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+
+          SERIALS="${{ github.event.inputs.serial_nos }}"
+          # Compact the label (strip spaces)
+          LABEL=$(echo "$SERIALS" | tr -d ' ')
+
+          git add "${{ env.TARGET_JSON }}" \
+                  list_of_already_processed_urls.txt \
+                  list_of_facing_error.txt 2>/dev/null || true
+
+          git diff --staged --quiet \
+            || git commit -m "Manual scrape — serial_no(s): ${LABEL}"
+
+          git push
+
+      # ── 7. Summary ────────────────────────────────────────────────
+      - name: Print summary
+        if: always()
+        run: |
+          echo "======================================================"
+          echo "  Manual scrape complete."
+          echo "  Target JSON  : ${{ env.TARGET_JSON }}"
+          echo "  Serial nos   : ${{ github.event.inputs.serial_nos }}"
+          echo "  Force rerun  : ${{ github.event.inputs.force_reprocess }}"
+          echo "======================================================"
