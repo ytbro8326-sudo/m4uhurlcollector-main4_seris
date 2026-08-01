@@ -40,11 +40,15 @@ IS_SERIES      = "series" in TARGET_JSON.lower()
 HTTPS_TEST_URL = "https://ww1.m4uhd.page/"
 
 # ── Concurrency tuning ───────────────────────────────────────────────────────
-# Webshare General API = 240 req/min  →  stay at 230 to leave headroom.
-# 4 item-workers × ~3 req/item/burst  → well within 230/min.
-RATE_LIMIT_RPS  = 230 / 60          # tokens per second  ≈ 3.83
-ITEM_WORKERS    = 4                  # parallel titles
-SERVER_WORKERS  = 4                  # parallel /ajax POSTs inside one episode
+# Reduced to avoid 419/429 "Too Many Requests" from the target site.
+# The site's /ajaxtv endpoint is sensitive; slow and steady wins.
+RATE_LIMIT_RPS  = 60 / 60           # tokens per second  ≈ 1 req/s
+ITEM_WORKERS    = 1                  # one title at a time (site bans bursts)
+SERVER_WORKERS  = 2                  # parallel /ajax POSTs inside one episode
+
+# Minimum pause between consecutive episode POSTs (seconds)
+EPISODE_DELAY_MIN = 1.5
+EPISODE_DELAY_MAX = 3.0
 
 # ── Webshare proxy ───────────────────────────────────────────────────────────
 WEBSHARE_PROXY = {
@@ -615,6 +619,8 @@ def fetch_servers_for_episode(root, token, ep_id, target_url, max_retries=3):
             )
             servers = spans(server_html)
             embeds  = fetch_all_servers_parallel(root, token, servers, target_url)
+            # Polite pause after each episode to avoid 419/429 rate-bans
+            time.sleep(random.uniform(EPISODE_DELAY_MIN, EPISODE_DELAY_MAX))
             return embeds
 
         except requests.exceptions.RequestException as e:
@@ -696,7 +702,7 @@ def extract_movie_servers(target_url, max_retries=3):
 #  ThreadPoolExecutor block below (EPISODE_WORKERS).
 # ══════════════════════════════════════════════════════════════════════════════
 
-EPISODE_WORKERS = 3    # parallel episodes per series (set to 1 to disable)
+EPISODE_WORKERS = 1    # sequential episodes — site 419s on concurrent bursts
 
 
 def extract_series_all_episodes(target_url, max_retries=3):
@@ -890,12 +896,24 @@ def main():
 
     print(f"\n[*] Records in {TARGET_JSON}: {len(data)}")
 
+    # ── Optional: restrict to specific serial_no values ─────────────────────
+    # Set via env var SERIAL_NOS="180,183,205" (comma-separated, no spaces needed)
+    _serial_nos_env = os.getenv("SERIAL_NOS", "").strip()
+    _target_serials: set[int] | None = None
+    if _serial_nos_env:
+        try:
+            _target_serials = {int(x.strip()) for x in _serial_nos_env.split(",") if x.strip()}
+            print(f"[*] Serial-no filter : {sorted(_target_serials)}")
+        except ValueError:
+            print(f"[!] Invalid SERIAL_NOS value '{_serial_nos_env}' — ignored.")
+
     if IS_SERIES:
         queue = [
             item for item in data
             if item.get("url")
             and not series_already_done(item)
             and item["url"] not in processed_urls
+            and (_target_serials is None or item.get("serial_no") in _target_serials)
         ]
     else:
         queue = [
@@ -903,9 +921,11 @@ def main():
             if item.get("url")
             and not item.get("server1")
             and item["url"] not in processed_urls
+            and (_target_serials is None or item.get("serial_no") in _target_serials)
         ]
 
-    if URL_LIMIT is not None:
+    # URL_LIMIT is ignored when serial_nos are explicitly specified
+    if URL_LIMIT is not None and _target_serials is None:
         queue = queue[:URL_LIMIT]
 
     print(f"[*] Items queued: {len(queue)}")
