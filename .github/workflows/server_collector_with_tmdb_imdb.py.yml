@@ -24,7 +24,7 @@ permissions:
 
 env:
   TARGET_JSON:   "series.json"
-  URL_LIMIT:     "10"
+  URL_LIMIT:     "1"
   RANGE_FILE:    "series_json.txt"   # serial_no range tracker
 
 jobs:
@@ -84,7 +84,7 @@ jobs:
           TARGET_JSON    = "series.json"
           PROCESSED_FILE = "list_of_already_processed_urls.txt"
           RANGE_FILE     = "series_json.txt"
-          URL_LIMIT      = 10
+          URL_LIMIT      = 1
 
           # ── guard: JSON must exist ──────────────────────────────────
           if not os.path.exists(TARGET_JSON):
