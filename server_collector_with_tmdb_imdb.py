@@ -1,17 +1,17 @@
 """
 server_collector_with_tmdb_imdb.py
 ====================================
-High-speed scraper — Webshare primary proxy, free-proxy fallback.
+Scraper — rotates across a fixed pool of 10 Webshare proxies.
 
-Speed architecture
-──────────────────
-• Token-bucket rate limiter (230 req/min) — stays under Webshare's 240/min cap.
-• Thread pool for items  (ITEM_WORKERS  = 4 concurrent titles at once).
-• Thread pool for servers (SERVER_WORKERS = 4 concurrent /ajax POSTs per episode).
-• Each worker thread owns its own requests.Session — no shared-session lock.
-• Blind sleeps replaced with retry-only back-off jitter.
-• CSRF token and root URL are cached per item-fetch so they're not re-parsed.
-• Thread-safe JSON accumulation; single atomic write at the end.
+Architecture
+────────────
+• 10 dedicated Webshare proxies in a round-robin pool (no free-proxy fallback).
+• On 419/429: rotate to the next proxy and back-off before retrying.
+• Sequential episodes (EPISODE_WORKERS=1) with a random delay between each
+  to avoid rate-bans on /ajaxtv.
+• Token-bucket rate limiter keeps total req/s gentle.
+• Per-thread requests.Session — no shared-lock bottleneck.
+• Thread-safe JSON write at the end.
 """
 
 import re
@@ -21,12 +21,10 @@ import os
 import time
 import random
 import threading
-import queue as _queue
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -50,19 +48,48 @@ SERVER_WORKERS  = 2                  # parallel /ajax POSTs inside one episode
 EPISODE_DELAY_MIN = 1.5
 EPISODE_DELAY_MAX = 3.0
 
-# ── Webshare proxy ───────────────────────────────────────────────────────────
-WEBSHARE_PROXY = {
-    "http":  "http://mjyfvhwg:avgrq102gw1y@31.59.20.176:6754/",
-    "https": "http://mjyfvhwg:avgrq102gw1y@31.59.20.176:6754/",
-}
-WEBSHARE_PROXY_URL    = "http://mjyfvhwg:avgrq102gw1y@31.59.20.176:6754/"
-WEBSHARE_FAIL_THRESHOLD = 3
+# ── Webshare rotating proxy pool ─────────────────────────────────────────────
+# All 10 proxies share the same credentials; IPs rotate round-robin.
+# On 419/429 the current proxy is skipped and the next one is used immediately.
+_WS_USER = "mjyfvhwg"
+_WS_PASS = "avgrq102gw1y"
+_WS_PROXIES_RAW = [
+    ("31.59.20.176",    "6754"),
+    ("31.56.127.193",   "7684"),
+    ("45.38.107.97",    "6014"),
+    ("198.105.121.200", "6462"),
+    ("64.137.96.74",    "6641"),
+    ("198.23.243.226",  "6361"),
+    ("38.154.185.97",   "6370"),
+    ("84.247.60.125",   "6095"),
+    ("142.111.67.146",  "5611"),
+    ("191.96.254.138",  "6185"),
+]
+WEBSHARE_POOL = [
+    f"http://{_WS_USER}:{_WS_PASS}@{ip}:{port}/"
+    for ip, port in _WS_PROXIES_RAW
+]
 
-# ── Global proxy-mode state ──────────────────────────────────────────────────
-_using_webshare    = True
-_webshare_failures = 0
-_proxy_lock        = threading.Lock()
-pool               = None            # ProxyPool — built only on fallback
+_proxy_lock  = threading.Lock()
+_proxy_index = 0   # round-robin cursor
+
+
+def _next_proxy() -> str:
+    global _proxy_index
+    with _proxy_lock:
+        url = WEBSHARE_POOL[_proxy_index % len(WEBSHARE_POOL)]
+        _proxy_index += 1
+    return url
+
+
+def _rotate_proxy() -> str:
+    """Advance cursor and return new proxy (call on 419/429 failure)."""
+    global _proxy_index
+    with _proxy_lock:
+        _proxy_index += 1
+        url = WEBSHARE_POOL[_proxy_index % len(WEBSHARE_POOL)]
+    print(f"  [proxy] Rotated to {url.split('@')[1]}")
+    return url
 
 
 def parse_url_limit():
@@ -142,277 +169,62 @@ def get_session() -> requests.Session:
     return _thread_local.session
 
 
-def _apply_proxy_to_session(s: requests.Session):
-    """Set the correct proxy on a session based on current global mode."""
-    with _proxy_lock:
-        using_ws = _using_webshare
-        if not using_ws and pool is not None:
-            proxy_url = pool.next()
-        else:
-            proxy_url = WEBSHARE_PROXY_URL
-
-    if using_ws:
-        s.proxies.update(WEBSHARE_PROXY)
-    else:
-        s.proxies.update({"http": proxy_url, "https": proxy_url})
+def _apply_proxy_to_session(s: requests.Session, proxy_url: str = None):
+    """Point the session at a Webshare proxy (round-robin by default)."""
+    url = proxy_url or _next_proxy()
+    s.proxies.update({"http": url, "https": url})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FREE PROXY SCRAPER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def scrape_free_proxies():
-    proxies = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-    def _fetch_source(name, fn):
-        nonlocal proxies
-        try:
-            before = len(proxies)
-            fn(proxies, headers)
-            print(f"  [+] {name:<28}: {len(proxies) - before} proxies")
-        except Exception as e:
-            print(f"  [-] {name} failed: {e}")
-
-    def _src_fpl(acc, h):
-        r = requests.get("https://free-proxy-list.net/", headers=h, timeout=10)
-        soup  = BeautifulSoup(r.text, "html.parser")
-        table = soup.find("table")
-        if table:
-            for row in table.find_all("tr")[1:]:
-                cols = row.find_all("td")
-                if len(cols) >= 7:
-                    ip     = cols[0].text.strip()
-                    port   = cols[1].text.strip()
-                    scheme = "https" if cols[6].text.strip().lower() == "yes" else "http"
-                    acc.append(f"{scheme}://{ip}:{port}")
-
-    def _src_ssl(acc, h):
-        r = requests.get("https://www.sslproxies.org/", headers=h, timeout=10)
-        soup  = BeautifulSoup(r.text, "html.parser")
-        table = soup.find("table")
-        if table:
-            for row in table.find_all("tr")[1:]:
-                cols = row.find_all("td")
-                if len(cols) >= 2:
-                    acc.append(f"https://{cols[0].text.strip()}:{cols[1].text.strip()}")
-
-    def _src_psc(acc, h):
-        url = (
-            "https://api.proxyscrape.com/v2/?request=displayproxies"
-            "&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all"
-        )
-        r = requests.get(url, headers=h, timeout=10)
-        for line in r.text.strip().splitlines():
-            line = line.strip()
-            if ":" in line:
-                acc.append(f"http://{line}")
-
-    def _src_geo(acc, h):
-        url = (
-            "https://proxylist.geonode.com/api/proxy-list"
-            "?limit=100&page=1&sort_by=lastChecked&sort_type=desc&protocols=http,https"
-        )
-        r    = requests.get(url, headers=h, timeout=10)
-        data = r.json()
-        for entry in data.get("data", []):
-            ip, port = entry.get("ip", ""), entry.get("port", "")
-            proto = entry.get("protocols", ["http"])[0]
-            if ip and port:
-                acc.append(f"{proto}://{ip}:{port}")
-
-    # Fetch all sources in parallel (they are external HTTP calls, not our target)
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {
-            ex.submit(_fetch_source, "free-proxy-list.net", _src_fpl): None,
-            ex.submit(_fetch_source, "sslproxies.org",      _src_ssl): None,
-            ex.submit(_fetch_source, "proxyscrape API",     _src_psc): None,
-            ex.submit(_fetch_source, "geonode API",         _src_geo): None,
-        }
-        for f in as_completed(futs):
-            f.result()   # surface any unexpected exception
-
-    proxies = list(dict.fromkeys(proxies))
-    print(f"\n  [*] Total unique proxies scraped: {len(proxies)}")
-    return proxies
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PROXY POOL  (free-proxy fallback)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ProxyPool:
-    def __init__(self, proxies, test_url=HTTPS_TEST_URL, timeout=10):
-        self._all      = proxies
-        self._live     = deque()
-        self._lock     = threading.Lock()
-        self._test_url = test_url
-        self._timeout  = timeout
-        self._validate_all()
-
-    # ── validation ──────────────────────────────────────────────────────────
-
-    def _validate_all(self):
-        print(f"\n[*] Validating {len(self._all)} proxies …")
-        with ThreadPoolExecutor(max_workers=min(100, len(self._all) or 1)) as ex:
-            list(ex.map(self._check, self._all))
-        print(f"[*] {len(self._live)} / {len(self._all)} proxies live.")
-        if not self._live:
-            raise RuntimeError("[!] No live free proxies found.")
-
-    def _check(self, proxy_url):
-        try:
-            r = requests.get(
-                self._test_url,
-                proxies={"http": proxy_url, "https": proxy_url},
-                timeout=self._timeout,
-                verify=False,
-                allow_redirects=True,
-            )
-            if r.status_code == 200:
-                with self._lock:
-                    self._live.append(proxy_url)
-                print(f"  [+] Live: {proxy_url}")
-        except Exception:
-            pass
-
-    # ── pool operations ─────────────────────────────────────────────────────
-
-    def next(self):
-        with self._lock:
-            if not self._live:
-                raise RuntimeError("[!] Pool empty.")
-            proxy = self._live.popleft()
-            self._live.append(proxy)
-            return proxy
-
-    def remove(self, proxy_url):
-        with self._lock:
-            try:
-                self._live.remove(proxy_url)
-                print(f"  [x] Removed dead proxy: {proxy_url} | Remaining: {len(self._live)}")
-            except ValueError:
-                pass
-
-    def size(self):
-        with self._lock:
-            return len(self._live)
-
-    def is_empty(self):
-        with self._lock:
-            return len(self._live) == 0
-
-    def refill(self):
-        print("\n[!] Pool low — re-scraping proxies …")
-        found = []
-        lock  = threading.Lock()
-
-        def _check_new(proxy_url):
-            try:
-                r = requests.get(
-                    self._test_url,
-                    proxies={"http": proxy_url, "https": proxy_url},
-                    timeout=self._timeout,
-                    verify=False,
-                    allow_redirects=True,
-                )
-                if r.status_code == 200:
-                    with lock:
-                        found.append(proxy_url)
-            except Exception:
-                pass
-
-        new_proxies = scrape_free_proxies()
-        with ThreadPoolExecutor(max_workers=min(100, len(new_proxies) or 1)) as ex:
-            list(ex.map(_check_new, new_proxies))
-
-        added = 0
-        with self._lock:
-            existing = set(self._live)
-            for p in found:
-                if p not in existing:
-                    self._live.append(p)
-                    added += 1
-        print(f"[*] Refill done. Added {added}. Pool size: {self.size()}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PROXY MANAGEMENT (global helpers)
+#  PROXY MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _is_rate_limited_or_blocked(status_or_exc):
     if isinstance(status_or_exc, int):
-        return status_or_exc in (403, 429, 503)
+        return status_or_exc in (403, 419, 429, 503)
     msg = str(status_or_exc).lower()
     return any(kw in msg for kw in (
-        "429", "too many", "rate limit", "forbidden", "403",
+        "419", "429", "too many", "rate limit", "forbidden", "403",
         "blocked", "connection refused", "timeout", "timed out",
         "remote disconnected", "reset by peer",
     ))
 
 
-def _init_free_pool():
-    global pool
-    print("\n[*] Falling back to free proxy pool …")
-    raw  = scrape_free_proxies()
-    pool = ProxyPool(raw, test_url=detect_target_host(TARGET_JSON))
-
-
 def report_bad_proxy(proxy_url=None):
-    """Called by any worker thread on request failure."""
-    global _using_webshare, _webshare_failures
-
-    with _proxy_lock:
-        if _using_webshare:
-            _webshare_failures += 1
-            fails = _webshare_failures
-        else:
-            fails = 0
-
-    if _using_webshare:
-        print(f"  [proxy] Webshare failure #{fails}/{WEBSHARE_FAIL_THRESHOLD}")
-        if fails >= WEBSHARE_FAIL_THRESHOLD:
-            with _proxy_lock:
-                _using_webshare = False
-            print("  [proxy] Switching to free proxy pool.")
-            _init_free_pool()
-        else:
-            time.sleep(random.uniform(4, 10))
-    else:
-        if proxy_url and pool:
-            pool.remove(proxy_url)
-        if pool and pool.is_empty():
-            pool.refill()
+    """Rotate to the next Webshare proxy and sleep briefly."""
+    new_proxy = _rotate_proxy()
+    # Short back-off so the new IP isn't immediately hit
+    delay = random.uniform(3.0, 7.0)
+    print(f"  [proxy] Sleeping {delay:.1f}s before retrying with next proxy …")
+    time.sleep(delay)
+    return new_proxy
 
 
 def reset_webshare_failures():
-    global _webshare_failures
-    with _proxy_lock:
-        _webshare_failures = 0
+    pass   # kept for API compatibility — no-op with rotating pool
 
 
 def init_proxy():
-    """Test Webshare once at startup; fall back immediately if unreachable."""
-    global _using_webshare
-    print(f"[*] Testing Webshare proxy …")
-    try:
-        r = requests.get(
-            HTTPS_TEST_URL,
-            proxies=WEBSHARE_PROXY,
-            timeout=12,
-            verify=False,
-            allow_redirects=True,
-        )
-        if r.status_code == 200:
-            print("  [proxy] Webshare OK — using as primary.")
-            return
-        print(f"  [proxy] Webshare returned HTTP {r.status_code}.")
-    except Exception as e:
-        print(f"  [proxy] Webshare test failed: {e}")
-
-    with _proxy_lock:
-        _using_webshare = False
-    _init_free_pool()
+    """Verify at least one Webshare proxy is reachable at startup."""
+    print(f"[*] Verifying Webshare proxy pool ({len(WEBSHARE_POOL)} proxies) …")
+    ok = 0
+    for proxy_url in WEBSHARE_POOL:
+        try:
+            r = requests.get(
+                HTTPS_TEST_URL,
+                proxies={"http": proxy_url, "https": proxy_url},
+                timeout=10,
+                verify=False,
+                allow_redirects=True,
+            )
+            if r.status_code == 200:
+                ok += 1
+        except Exception:
+            pass
+    if ok == 0:
+        print("  [proxy] WARNING: no Webshare proxies responded — will try anyway.")
+    else:
+        print(f"  [proxy] {ok}/{len(WEBSHARE_POOL)} proxies responded OK.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -626,8 +438,8 @@ def fetch_servers_for_episode(root, token, ep_id, target_url, max_retries=3):
         except requests.exceptions.RequestException as e:
             print(f"    [!] Episode {ep_id} attempt {attempt + 1}/{max_retries}: {e}")
             if attempt < max_retries - 1:
-                report_bad_proxy(proxy_used)
-                _apply_proxy_to_session(session)   # refresh proxy on THIS thread's session
+                new_proxy = report_bad_proxy(proxy_used)
+                _apply_proxy_to_session(session, new_proxy)
             else:
                 print(f"    [!] Giving up on episode {ep_id}.")
                 return []
@@ -683,8 +495,8 @@ def extract_movie_servers(target_url, max_retries=3):
         except requests.exceptions.RequestException as e:
             print(f"  [!] Attempt {attempt + 1}/{max_retries}: {e}")
             if attempt < max_retries - 1:
-                report_bad_proxy(proxy_used)
-                _apply_proxy_to_session(session)
+                new_proxy = report_bad_proxy(proxy_used)
+                _apply_proxy_to_session(session, new_proxy)
             else:
                 log_error(target_url, f"Failed after {max_retries} retries: {e}")
                 return []
@@ -730,8 +542,8 @@ def extract_series_all_episodes(target_url, max_retries=3):
         except requests.exceptions.RequestException as e:
             print(f"  [!] Series page attempt {attempt + 1}/{max_retries}: {e}")
             if attempt < max_retries - 1:
-                report_bad_proxy(proxy_used)
-                _apply_proxy_to_session(session)
+                new_proxy = report_bad_proxy(proxy_used)
+                _apply_proxy_to_session(session, new_proxy)
             else:
                 log_error(target_url, f"Series page failed: {e}")
                 return None
@@ -873,15 +685,7 @@ def process_item(item):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    limit_label = "full" if URL_LIMIT is None else str(URL_LIMIT)
-    print(f"[*] Target JSON   : {TARGET_JSON}")
-    print(f"[*] Mode          : {'SERIES' if IS_SERIES else 'MOVIES'}")
-    print(f"[*] URL limit     : {limit_label}")
-    print(f"[*] Item workers  : {ITEM_WORKERS}")
-    print(f"[*] Server workers: {SERVER_WORKERS}")
-    if IS_SERIES:
-        print(f"[*] Episode workers: {EPISODE_WORKERS}")
-    print(f"[*] Rate limit    : {RATE_LIMIT_RPS * 60:.0f} req/min (Webshare cap = 240)")
+    pass  # banner removed
 
     if not os.path.exists(TARGET_JSON):
         print(f"[!] {TARGET_JSON} not found.")
@@ -957,8 +761,6 @@ def main():
                         completed += 1
                         processed_urls.add(orig_item["url"])
                         log_processed(orig_item["url"])
-                        if _using_webshare:
-                            reset_webshare_failures()
                     else:
                         failed += 1
 
@@ -967,10 +769,12 @@ def main():
                     print(f"  [!] Worker future exception: {e}")
                     log_error(orig_item.get("url", "?"), f"Future exception: {e}")
 
+                with _proxy_lock:
+                    cur_proxy = WEBSHARE_POOL[_proxy_index % len(WEBSHARE_POOL)].split("@")[1]
                 print(
                     f"  [progress] done={completed} failed={failed} "
                     f"remaining={len(queue) - completed - failed} "
-                    f"proxy={'Webshare' if _using_webshare else 'FreePool'}"
+                    f"proxy={cur_proxy}"
                 )
 
     except KeyboardInterrupt:
@@ -979,7 +783,7 @@ def main():
         with open(TARGET_JSON, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
         print(f"\n[*] Saved {TARGET_JSON}.")
-        print(f"[*] Completed={completed} | Failed={failed} | Proxy={'Webshare' if _using_webshare else 'FreePool'}")
+        print(f"[*] Completed={completed} | Failed={failed} | Proxy=Webshare (rotating pool)")
 
 
 if __name__ == "__main__":
